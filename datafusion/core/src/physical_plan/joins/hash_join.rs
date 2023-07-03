@@ -1436,6 +1436,8 @@ mod tests {
         let columns = columns(&join.schema());
 
         let mut batches = vec![];
+        println!("{:?}", join.left);
+        println!("{:?}", join.right);
         for i in 0..partition_count {
             let stream = join.execute(i, context.clone())?;
             let more_batches = common::collect(stream).await?;

@@ -40,7 +40,7 @@ use log::trace;
 
 use self::distributor_channels::{DistributionReceiver, DistributionSender};
 
-use super::common::{AbortOnDropMany, AbortOnDropSingle, SharedMemoryReservation};
+use super::common::SharedMemoryReservation;
 use super::expressions::PhysicalSortExpr;
 use super::metrics::{self, ExecutionPlanMetricsSet, MetricBuilder, MetricsSet};
 use super::{RecordBatchStream, SendableRecordBatchStream};
@@ -54,13 +54,25 @@ use futures::stream::Stream;
 use futures::{FutureExt, StreamExt};
 use hashbrown::HashMap;
 use parking_lot::Mutex;
-use tokio::task::JoinHandle;
+use tokio::sync::Mutex as AsyncMutex;
+use tokio::task::JoinSet;
 
 mod distributor_channels;
 
 type MaybeBatch = Option<Result<RecordBatch>>;
 type InputPartitionsToCurrentPartitionSender = Vec<DistributionSender<MaybeBatch>>;
 type InputPartitionsToCurrentPartitionReceiver = Vec<DistributionReceiver<MaybeBatch>>;
+type PullResultJoinSet = JoinSet<PullResult<usize>>;
+
+/// Result type for pull tasks.
+type PullResult<T, E = PullError> = core::result::Result<T, E>;
+
+/// Encapsulates partition information besides the actual error.
+#[derive(Debug)]
+struct PullError {
+    partition: usize,
+    source: DataFusionError,
+}
 
 /// Inner state of [`RepartitionExec`].
 #[derive(Debug)]
@@ -76,8 +88,8 @@ struct RepartitionExecState {
         ),
     >,
 
-    /// Helper that ensures that that background job is killed once it is no longer needed.
-    abort_helper: Arc<AbortOnDropMany<()>>,
+    /// Ensure that background job is killed once it is no longer needed.
+    join_set: Arc<AsyncMutex<PullResultJoinSet>>,
 }
 
 /// A utility that can be used to partition batches based on [`Partitioning`]
@@ -424,7 +436,7 @@ impl ExecutionPlan for RepartitionExec {
             }
 
             // launch one async task per *input* partition
-            let mut join_handles = Vec::with_capacity(num_input_partitions);
+            let mut join_set = JoinSet::new();
             for i in 0..num_input_partitions {
                 let txs: HashMap<_, _> = state
                     .channels
@@ -436,28 +448,26 @@ impl ExecutionPlan for RepartitionExec {
 
                 let r_metrics = RepartitionMetrics::new(i, partition, &self.metrics);
 
-                let input_task: JoinHandle<Result<()>> =
-                    tokio::spawn(Self::pull_from_input(
-                        self.input.clone(),
-                        i,
-                        txs.clone(),
-                        self.partitioning.clone(),
-                        r_metrics,
-                        context.clone(),
-                    ));
+                join_set.spawn(Self::pull_from_input(
+                    self.input.clone(),
+                    i,
+                    txs.clone(),
+                    self.partitioning.clone(),
+                    r_metrics,
+                    context.clone(),
+                ));
 
                 // In a separate task, wait for each input to be done
                 // (and pass along any errors, including panic!s)
-                let join_handle = tokio::spawn(Self::wait_for_task(
-                    AbortOnDropSingle::new(input_task),
-                    txs.into_iter()
-                        .map(|(partition, (tx, _reservation))| (partition, tx))
-                        .collect(),
-                ));
-                join_handles.push(join_handle);
+                // let join_handle = tokio::spawn(Self::wait_for_task(
+                //     AbortOnDropSingle::new(input_task),
+                //     txs.into_iter()
+                //         .map(|(partition, (tx, _reservation))| (partition, tx))
+                //         .collect(),
+                // ));
             }
 
-            state.abort_helper = Arc::new(AbortOnDropMany(join_handles))
+            state.join_set = Arc::new(AsyncMutex::new(join_set));
         }
 
         trace!(
@@ -466,12 +476,89 @@ impl ExecutionPlan for RepartitionExec {
             partition
         );
 
+        // Create a stream that checks the result of the join set, and
+        // propagates panic if seen
+        let check = {
+            let join_set = Arc::clone(&state.join_set);
+            //println!("state.channels: {:?}", state.channels);
+            let txs: HashMap<_, _> = state
+                .channels
+                .iter()
+                .map(|(partition, (tx, _rx, _reservation))| (*partition, tx.clone()))
+                .collect();
+            println!("{:#?}", txs);
+            async move {
+                println!("acquire join_set lock");
+                let mut join_set = join_set.lock().await;
+                println!("unacquire join_set lock");
+                while let Some(result) = join_set.join_next().await {
+                    match result {
+                        Ok(res) => match res {
+                            Ok(input_partition) => {
+                                println!("join 1");
+                                // Send None to all output partitions that
+                                // this input partition corresponds to
+                                for (output_partition, tx) in txs.iter() {
+                                    let tx = &tx[input_partition];
+                                    println!("sending None to tx: {}", output_partition);
+                                    tx.send(None).await.unwrap();
+                                }
+                            }
+                            Err(e) => {
+                                println!("join 2");
+                                let input_partition = e.partition;
+                                println!("input_partition: {}", input_partition);
+                                println!("txs: {:?}", txs);
+                                let txs: Vec<_> = txs
+                                    .iter()
+                                    .map(|(_output_partition, tx)| {
+                                        tx[input_partition].clone()
+                                    })
+                                    .collect();
+
+                                let e = Arc::new(e.source);
+                                println!("txs: {:?}", txs);
+                                for tx in txs {
+                                    println!("tx: {:?}", tx);
+
+                                    // wrap it because need to send error to all output partitions
+                                    let err = Err(DataFusionError::External(Box::new(
+                                        e.clone(),
+                                    )));
+                                    tx.send(Some(err)).await.unwrap();
+                                }
+                            }
+                        },
+                        Err(e) => {
+                            println!("join 3");
+                            if e.is_panic() {
+                                std::panic::resume_unwind(e.into_panic());
+                            } else {
+                                unreachable!();
+                            }
+                        }
+                    }
+
+                    println!("Join finished\n\n");
+                }
+
+                // None
+            }
+        };
+        tokio::spawn(check);
+        //let check_stream = futures::stream::once(check).filter_map(|x| async move { x });
+
         // now return stream for the specified *output* partition which will
         // read from the channel
-        let (_tx, mut rx, reservation) = state
+        let (tx, mut rx, reservation) = state
             .channels
             .remove(&partition)
             .expect("partition not used yet");
+
+        // Reinsert txs so that the join call is executed correctly
+        state
+            .channels
+            .insert(partition, (tx, vec![], reservation.clone()));
 
         if self.preserve_order {
             // Store streams from all the input partitions:
@@ -481,7 +568,7 @@ impl ExecutionPlan for RepartitionExec {
                     Box::pin(PerPartitionStream {
                         schema: self.schema(),
                         receiver,
-                        drop_helper: Arc::clone(&state.abort_helper),
+                        join_set: Arc::clone(&state.join_set),
                         reservation: reservation.clone(),
                     }) as SendableRecordBatchStream
                 })
@@ -499,14 +586,16 @@ impl ExecutionPlan for RepartitionExec {
                 context.session_config().batch_size(),
             )
         } else {
-            Ok(Box::pin(RepartitionStream {
+            let repartition_stream = RepartitionStream {
+                partition,
                 num_input_partitions,
                 num_input_partitions_processed: 0,
                 schema: self.input.schema(),
                 input: rx.swap_remove(0),
-                drop_helper: Arc::clone(&state.abort_helper),
+                join_set: Arc::clone(&state.join_set),
                 reservation,
-            }))
+            };
+            Ok(Box::pin(repartition_stream))
         }
     }
 
@@ -548,7 +637,7 @@ impl RepartitionExec {
             partitioning,
             state: Arc::new(Mutex::new(RepartitionExecState {
                 channels: HashMap::new(),
-                abort_helper: Arc::new(AbortOnDropMany::<()>(vec![])),
+                join_set: Arc::new(AsyncMutex::new(JoinSet::new())),
             })),
             metrics: ExecutionPlanMetricsSet::new(),
             preserve_order: false,
@@ -564,7 +653,15 @@ impl RepartitionExec {
     /// Pulls data from the specified input plan, feeding it to the
     /// output partitions based on the desired partitioning
     ///
-    /// txs hold the output sending channels for each output partition
+    /// # Arguments
+    ///
+    /// * `partition` - The input partition to pull from
+    /// * `output_channels` - Map from (output) partition to output channel to send the
+    ///                       data or propagate error to
+    ///
+    /// # Returns
+    ///
+    /// * Input partition
     async fn pull_from_input(
         input: Arc<dyn ExecutionPlan>,
         partition: usize,
@@ -575,13 +672,20 @@ impl RepartitionExec {
         partitioning: Partitioning,
         metrics: RepartitionMetrics,
         context: Arc<TaskContext>,
-    ) -> Result<()> {
+    ) -> PullResult<usize> {
         let mut partitioner =
-            BatchPartitioner::try_new(partitioning, metrics.repartition_time.clone())?;
+            BatchPartitioner::try_new(partitioning, metrics.repartition_time.clone())
+                .map_err(|err| PullError {
+                    partition,
+                    source: err,
+                })?;
 
         // execute the child operator
         let timer = metrics.fetch_time.timer();
-        let mut stream = input.execute(partition, context)?;
+        let mut stream = input.execute(partition, context).map_err(|err| PullError {
+            partition,
+            source: err,
+        })?;
         timer.done();
 
         // While there are still outputs to send to, keep pulling inputs
@@ -594,23 +698,40 @@ impl RepartitionExec {
 
             // Input is done
             let batch = match result {
-                Some(result) => result?,
+                Some(result) => result.map_err(|err| PullError {
+                    partition,
+                    source: err,
+                })?,
                 None => break,
             };
 
-            for res in partitioner.partition_iter(batch)? {
-                let (partition, batch) = res?;
+            for res in partitioner.partition_iter(batch).map_err(|err| PullError {
+                partition,
+                source: err,
+            })? {
+                let (output_partition, batch) = res.map_err(|err| PullError {
+                    partition,
+                    source: err,
+                })?;
                 let size = batch.get_array_memory_size();
 
                 let timer = metrics.send_time.timer();
                 // if there is still a receiver, send to it
-                if let Some((tx, reservation)) = output_channels.get_mut(&partition) {
-                    reservation.lock().try_grow(size)?;
+                if let Some((tx, reservation)) =
+                    output_channels.get_mut(&output_partition)
+                {
+                    reservation.lock().try_grow(size).map_err(|err| PullError {
+                        partition,
+                        source: err,
+                    })?;
 
+                    println!("{} -> {}: sending batch", partition, output_partition);
+                    // println!("{:?}", batch);
+                    // println!("{:?}", tx);
                     if tx.send(Some(Ok(batch))).await.is_err() {
                         // If the other end has hung up, it was an early shutdown (e.g. LIMIT)
                         reservation.lock().shrink(size);
-                        output_channels.remove(&partition);
+                        output_channels.remove(&output_partition);
                     }
                 }
                 timer.done();
@@ -640,55 +761,15 @@ impl RepartitionExec {
             }
         }
 
-        Ok(())
-    }
+        println!("pull from input partition {} done", partition);
 
-    /// Waits for `input_task` which is consuming one of the inputs to
-    /// complete. Upon each successful completion, sends a `None` to
-    /// each of the output tx channels to signal one of the inputs is
-    /// complete. Upon error, propagates the errors to all output tx
-    /// channels.
-    async fn wait_for_task(
-        input_task: AbortOnDropSingle<Result<()>>,
-        txs: HashMap<usize, DistributionSender<MaybeBatch>>,
-    ) {
-        // wait for completion, and propagate error
-        // note we ignore errors on send (.ok) as that means the receiver has already shutdown.
-        match input_task.await {
-            // Error in joining task
-            Err(e) => {
-                let e = Arc::new(e);
-
-                for (_, tx) in txs {
-                    let err = Err(DataFusionError::Context(
-                        "Join Error".to_string(),
-                        Box::new(DataFusionError::External(Box::new(Arc::clone(&e)))),
-                    ));
-                    tx.send(Some(err)).await.ok();
-                }
-            }
-            // Error from running input task
-            Ok(Err(e)) => {
-                let e = Arc::new(e);
-
-                for (_, tx) in txs {
-                    // wrap it because need to send error to all output partitions
-                    let err = Err(DataFusionError::External(Box::new(e.clone())));
-                    tx.send(Some(err)).await.ok();
-                }
-            }
-            // Input task completed successfully
-            Ok(Ok(())) => {
-                // notify each output partition that this input partition has no more data
-                for (_, tx) in txs {
-                    tx.send(None).await.ok();
-                }
-            }
-        }
+        Ok(partition)
     }
 }
 
 struct RepartitionStream {
+    partition: usize,
+
     /// Number of input partitions that will be sending batches to this output channel
     num_input_partitions: usize,
 
@@ -703,7 +784,7 @@ struct RepartitionStream {
 
     /// Handle to ensure background tasks are killed when no longer needed.
     #[allow(dead_code)]
-    drop_helper: Arc<AbortOnDropMany<()>>,
+    join_set: Arc<AsyncMutex<PullResultJoinSet>>,
 
     /// Memory reservation.
     reservation: SharedMemoryReservation,
@@ -719,6 +800,7 @@ impl Stream for RepartitionStream {
         loop {
             match self.input.recv().poll_unpin(cx) {
                 Poll::Ready(Some(Some(v))) => {
+                    println!("{} recv 1", self.partition);
                     if let Ok(batch) = &v {
                         self.reservation
                             .lock()
@@ -728,9 +810,12 @@ impl Stream for RepartitionStream {
                     return Poll::Ready(Some(v));
                 }
                 Poll::Ready(Some(None)) => {
+                    println!("{} recv 2", self.partition);
+
                     self.num_input_partitions_processed += 1;
 
                     if self.num_input_partitions == self.num_input_partitions_processed {
+                        println!("recv finished");
                         // all input partitions have finished sending batches
                         return Poll::Ready(None);
                     } else {
@@ -739,9 +824,11 @@ impl Stream for RepartitionStream {
                     }
                 }
                 Poll::Ready(None) => {
+                    println!("{} recv 3", self.partition);
                     return Poll::Ready(None);
                 }
                 Poll::Pending => {
+                    println!("{} recv 4", self.partition);
                     return Poll::Pending;
                 }
             }
@@ -767,7 +854,7 @@ struct PerPartitionStream {
 
     /// Handle to ensure background tasks are killed when no longer needed.
     #[allow(dead_code)]
-    drop_helper: Arc<AbortOnDropMany<()>>,
+    join_set: Arc<AsyncMutex<PullResultJoinSet>>,
 
     /// Memory reservation.
     reservation: SharedMemoryReservation,
@@ -782,6 +869,7 @@ impl Stream for PerPartitionStream {
     ) -> Poll<Option<Self::Item>> {
         match self.receiver.recv().poll_unpin(cx) {
             Poll::Ready(Some(Some(v))) => {
+                println!("recv 1");
                 if let Ok(batch) = &v {
                     self.reservation
                         .lock()
@@ -790,11 +878,18 @@ impl Stream for PerPartitionStream {
                 Poll::Ready(Some(v))
             }
             Poll::Ready(Some(None)) => {
+                println!("recv 2");
                 // Input partition has finished sending batches
                 Poll::Ready(None)
             }
-            Poll::Ready(None) => Poll::Ready(None),
-            Poll::Pending => Poll::Pending,
+            Poll::Ready(None) => {
+                println!("recv 3");
+                Poll::Ready(None)
+            }
+            Poll::Pending => {
+                println!("recv 4");
+                Poll::Pending
+            }
         }
     }
 }
@@ -1018,10 +1113,9 @@ mod tests {
         let output_stream = exec.execute(0, task_ctx).unwrap();
 
         // Expect that an error is returned
-        let result_string = crate::physical_plan::common::collect(output_stream)
-            .await
-            .unwrap_err()
-            .to_string();
+        let res = crate::physical_plan::common::collect(output_stream).await;
+        println!("{:?}", res);
+        let result_string = res.unwrap_err().to_string();
         assert!(
             result_string.contains("ErrorExec, unsurprisingly, errored in partition 0"),
             "actual: {result_string}"

@@ -218,6 +218,14 @@ pub struct RecordBatchReceiverStream {
 }
 
 impl RecordBatchReceiverStream {
+    /// Create a new stream from a schema and an inner stream
+    pub fn new(
+        schema: SchemaRef,
+        inner: BoxStream<'static, Result<RecordBatch>>,
+    ) -> Self {
+        Self { schema, inner }
+    }
+
     /// Create a builder with an internal buffer of capacity batches.
     pub fn builder(
         schema: SchemaRef,
